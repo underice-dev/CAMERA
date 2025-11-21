@@ -2,6 +2,7 @@ import os
 import sys
 import cv2
 import numpy as np
+from skeleton_detector import skeleton_longest_endpoints
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel,
                              QPushButton, QVBoxLayout, QFileDialog, QTextEdit,
                              QScrollArea, QSizePolicy, QDialog, QLineEdit,
@@ -257,10 +258,12 @@ class PowderSegmentApp(QMainWindow):
             morph_size = self.params['morph_size']
             kernel = np.ones((morph_size, morph_size), np.uint8)
             closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+            open_kernel = np.ones((3, 3), np.uint8)
+            cleaned = cv2.morphologyEx(closed, cv2.MORPH_OPEN, open_kernel)
 
             # 找轮廓
             contours, _ = cv2.findContours(
-                closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
             )
 
             result_image = image.copy()
@@ -282,6 +285,8 @@ class PowderSegmentApp(QMainWindow):
                 (255, 0, 255),
                 (0, 255, 255)
             ]
+
+            h_img, w_img = cleaned.shape
 
             for cnt in contours:
                 perimeter = cv2.arcLength(cnt, True)
@@ -306,8 +311,30 @@ class PowderSegmentApp(QMainWindow):
                 if aspect_ratio < MIN_ASPECT_RATIO:
                     continue
 
-                # 有效长度：长边 - 短边，大致扣掉两端圆头/椭圆弧
-                effective_length_px = max(long_side - short_side, 0)
+                x, y, bw, bh = cv2.boundingRect(cnt)
+                pad = max(4, morph_size)
+                x0 = max(x - pad, 0)
+                y0 = max(y - pad, 0)
+                x1 = min(x + bw + pad, w_img)
+                y1 = min(y + bh + pad, h_img)
+
+                if x1 <= x0 or y1 <= y0:
+                    continue
+
+                roi_mask = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
+                shifted_cnt = cnt - [x0, y0]
+                cv2.drawContours(roi_mask, [shifted_cnt], -1, 255, -1)
+
+                skel_info = skeleton_longest_endpoints(roi_mask)
+                if skel_info and skel_info.get("length_px", 0) > 0:
+                    effective_length_px = skel_info["length_px"]
+                    pt1_global = (skel_info["pt1"][0] + x0, skel_info["pt1"][1] + y0)
+                    pt2_global = (skel_info["pt2"][0] + x0, skel_info["pt2"][1] + y0)
+                else:
+                    # 回退到几何近似长度
+                    effective_length_px = max(long_side - short_side, 0)
+                    pt1_global = None
+                    pt2_global = None
 
                 length_mm = effective_length_px / pixels_per_mm
                 height_mm = short_side / pixels_per_mm
@@ -325,7 +352,8 @@ class PowderSegmentApp(QMainWindow):
                     "length_mm": length_mm,
                     "height_mm": height_mm,
                     "area": area,
-                    "aspect_ratio": aspect_ratio
+                    "aspect_ratio": aspect_ratio,
+                    "endpoints": (pt1_global, pt2_global)
                 })
 
             if not detected_segments:
@@ -354,9 +382,21 @@ class PowderSegmentApp(QMainWindow):
                 # 画旋转矩形
                 cv2.drawContours(result_image, [box], 0, color, 2)
 
+                if seg.get("endpoints") and all(seg["endpoints"]):
+                    cv2.circle(result_image, seg["endpoints"][0], 4, color, -1)
+                    cv2.circle(result_image, seg["endpoints"][1], 4, color, -1)
+
                 # 文本标注：编号 + d/h
                 text = f"{idx}: d={length_mm:.2f} mm, h={height_mm:.2f} mm"
-                text_org = (int(cx) - 50, int(cy))  # 大致放在中心位置附近
+                # 将文字尽量放在粉末外侧：优先框上方，不够则框下方
+                min_x = int(np.min(box[:, 0]))
+                min_y = int(np.min(box[:, 1]))
+                max_y = int(np.max(box[:, 1]))
+                text_x = max(min_x, 5)
+                text_y = min_y - 8
+                if text_y < 15:
+                    text_y = max_y + 18
+                text_org = (text_x, text_y)
                 cv2.putText(
                     result_image,
                     text,
