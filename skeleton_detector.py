@@ -18,12 +18,9 @@ def _neighbors(mask: np.ndarray, y: int, x: int):
 
 
 def _prune_short_branches(skel: np.ndarray, min_branch_len: int = 8):
-    """
-    Iteratively remove short spurs to suppress noisy degree-1 branches.
-    """
+    """Iteratively remove short spurs to suppress noisy degree-1 branches."""
     pruned = skel.copy().astype(np.uint8)
     h, w = pruned.shape
-
     while True:
         endpoints = [
             (y, x)
@@ -33,37 +30,28 @@ def _prune_short_branches(skel: np.ndarray, min_branch_len: int = 8):
         ]
         if not endpoints:
             break
-
         removed_any = False
         for ep in endpoints:
             path = [ep]
             prev = None
             cur = ep
-
-            # Walk forward until hitting a junction/end
             while True:
                 neigh = _neighbors(pruned, cur[0], cur[1])
                 if prev is not None:
                     neigh = [n for n in neigh if n != prev]
                 if len(neigh) != 1:
                     break
-
                 prev = cur
                 cur = neigh[0]
                 path.append(cur)
-
-                # Stop if we reach a junction or another endpoint
                 if len(_neighbors(pruned, cur[0], cur[1])) != 2:
                     break
-
             if len(path) < min_branch_len:
                 for py, px in path:
                     pruned[py, px] = 0
                 removed_any = True
-
         if not removed_any:
             break
-
     return pruned
 
 
@@ -109,7 +97,51 @@ def _bfs_farthest(start_idx: int, neighbors):
     return far_idx, dist, parent
 
 
-def skeleton_longest_endpoints(mask: np.ndarray):
+def prune_skeleton(mask: np.ndarray, min_branch_len: int = 8):
+    skel = skeletonize(mask > 0)
+    skel = _prune_short_branches(skel, min_branch_len=min_branch_len)
+    return skel
+
+
+def _centerline_length_from_skeleton(mask: np.ndarray, min_branch_len: int = 8):
+    """
+    Simple centerline fit: order skeleton points by y then moving median x, smooth, sum length.
+    """
+    skel = prune_skeleton(mask, min_branch_len=min_branch_len)
+    pts = np.argwhere(skel > 0)
+    if len(pts) < 2:
+        return None
+    ys = pts[:, 0]
+    xs = pts[:, 1]
+    order = np.argsort(ys)
+    ys_sorted = ys[order]
+    xs_sorted = xs[order]
+    # bin by y with step 1, take median x
+    y_unique = np.unique(ys_sorted)
+    center_pts = []
+    for y in y_unique:
+        xs_at_y = xs_sorted[ys_sorted == y]
+        med_x = np.median(xs_at_y)
+        center_pts.append((float(y), float(med_x)))
+    if len(center_pts) < 2:
+        return None
+    # smooth with simple moving average window 3
+    smoothed = []
+    win = 3
+    for i in range(len(center_pts)):
+        ys_window = [center_pts[j][0] for j in range(max(0, i - win), min(len(center_pts), i + win + 1))]
+        xs_window = [center_pts[j][1] for j in range(max(0, i - win), min(len(center_pts), i + win + 1))]
+        smoothed.append((np.mean(ys_window), np.mean(xs_window)))
+    coords = np.array([(p[1], p[0]) for p in smoothed], dtype=np.float32)  # (x,y)
+    diffs = np.diff(coords, axis=0)
+    length = float(np.sum(np.linalg.norm(diffs, axis=1)))
+    pt1 = (int(coords[0][0]), int(coords[0][1]))
+    pt2 = (int(coords[-1][0]), int(coords[-1][1]))
+    skel_u8 = (skel.astype(np.uint8)) * 255
+    return {"length_px": length, "pt1": pt1, "pt2": pt2, "skeleton": skel_u8}
+
+
+def skeleton_longest_endpoints(mask: np.ndarray, min_branch_len: int = 8):
     """
     Locate the two farthest endpoints along the skeleton of a binary mask.
 
@@ -123,8 +155,7 @@ def skeleton_longest_endpoints(mask: np.ndarray):
     if mask is None or mask.size == 0:
         return None
 
-    skel = skeletonize(mask > 0)
-    skel = _prune_short_branches(skel, min_branch_len=8)
+    skel = prune_skeleton(mask, min_branch_len=min_branch_len)
     skel_u8 = (skel.astype(np.uint8)) * 255
 
     coords, idx_map, neighbors = _build_graph(skel)
